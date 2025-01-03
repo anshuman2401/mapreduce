@@ -25,6 +25,9 @@ public class HBaseJobRunner {
             case "HBaseDeleteJob":
                 exitCode = ToolRunner.run(new HBaseDeleteJob(), jobArgs);
                 break;
+            case "OptimizedHBaseToHDFS":
+                exitCode = ToolRunner.run(new OptimizedHBaseDeleteJob(), jobArgs);
+                break;
             default:
                 System.err.println("Unknown job: " + jobName);
                 System.exit(-1);

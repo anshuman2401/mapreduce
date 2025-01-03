@@ -17,14 +17,15 @@ import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
-public class HBaseDeleteJob extends Configured implements Tool {
+public class OptimizedHBaseDeleteJob extends Configured implements Tool {
 
     @Override
     public int run(String[] args) throws Exception {
         if (args.length != 5) {
-            System.err.println("Usage: HBaseDeleteJob <ZOOKEEPER_QUORUM> <ZOOKEEPER_PORT> <hbase_table_name> <input_path> " +
-                    "<output_path>");
+            System.err.println("Usage: HBaseDeleteJob <ZOOKEEPER_QUORUM> <ZOOKEEPER_PORT> <hbase_table_name> <input_path> <output_path>");
             System.exit(-1);
         }
 
@@ -42,8 +43,8 @@ public class HBaseDeleteJob extends Configured implements Tool {
         config.setInt("hbase.rpc.timeout", 60000);
         config.setInt("hbase.client.operation.timeout", 120000);
 
-        Job job = Job.getInstance(config, "HBase Delete Job");
-        job.setJarByClass(HBaseDeleteJob.class);
+        Job job = Job.getInstance(config, "Optimized HBase Delete Job");
+        job.setJarByClass(OptimizedHBaseDeleteJob.class);
         job.setMapperClass(HBaseDeleteMapper.class);
         job.setInputFormatClass(TextInputFormat.class);
 
@@ -52,11 +53,20 @@ public class HBaseDeleteJob extends Configured implements Tool {
 
         job.setNumReduceTasks(0);
 
-        return job.waitForCompletion(true) ? 0 : 1;
+        int jobStatus = job.waitForCompletion(true) ? 0 : 1;
+
+        long rowsDeleted = job.getCounters().findCounter("HBaseDeleteJob", "RowsDeleted").getValue();
+        long rowsFailed = job.getCounters().findCounter("HBaseDeleteJob", "RowsFailed").getValue();
+
+        System.out.println("Rows Deleted: " + rowsDeleted);
+        System.out.println("Rows Failed: " + rowsFailed);
+        return jobStatus;
     }
 
     public static class HBaseDeleteMapper extends Mapper<LongWritable, Text, Text, Text> {
         private Table table;
+        private List<Delete> deleteBatch;
+        private static final int BATCH_SIZE = 50;
 
         @Override
         protected void setup(Context context) throws IOException {
@@ -64,24 +74,36 @@ public class HBaseDeleteJob extends Configured implements Tool {
             Connection connection = ConnectionFactory.createConnection(config);
             String tableName = config.get("hbase.table.name");
             table = connection.getTable(org.apache.hadoop.hbase.TableName.valueOf(tableName));
+            deleteBatch = new ArrayList<>();
         }
 
         @Override
-        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+        protected void map(LongWritable key, Text value, Context context) {
             String rowKey = value.toString().trim();
-            Delete delete = new Delete(Bytes.toBytes(rowKey));
-            try {
-                table.delete(delete);
-                context.write(new Text(rowKey), new Text("Deleted"));
-            }catch(Exception e) {
-                context.write(new Text("Failed to delete row: "), new Text(rowKey));
-                context.write(new Text("Error: "), new Text(e.getMessage()));
-                throw e;
+            deleteBatch.add(new Delete(Bytes.toBytes(rowKey)));
+            // Perform batched deletes
+            if (deleteBatch.size() >= BATCH_SIZE) {
+                flushDeletes(context);
+            }
+        }
+
+        private void flushDeletes(Context context) {
+            List<Delete> tempDeleteBatch = new ArrayList<>(deleteBatch);
+            if (!tempDeleteBatch.isEmpty()) {
+                try {
+                    table.delete(tempDeleteBatch);
+                    context.getCounter("HBaseDeleteJob", "RowsDeleted").increment(deleteBatch.size());
+                } catch (Exception e) {
+                    context.getCounter("HBaseDeleteJob", "RowsFailed").increment(deleteBatch.size());
+                }
+
+                deleteBatch.clear();
             }
         }
 
         @Override
         protected void cleanup(Context context) throws IOException {
+            flushDeletes(context); // Ensure any remaining deletes are processed
             if (table != null) {
                 table.close();
             }
@@ -89,7 +111,7 @@ public class HBaseDeleteJob extends Configured implements Tool {
     }
 
     public static void main(String[] args) throws Exception {
-        int exitCode = ToolRunner.run(new HBaseDeleteJob(), args);
+        int exitCode = ToolRunner.run(new OptimizedHBaseDeleteJob(), args);
         System.exit(exitCode);
     }
 }
